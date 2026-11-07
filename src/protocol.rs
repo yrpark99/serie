@@ -10,14 +10,21 @@ use ratatui::{
     style::{Color, Style},
 };
 
-// By default assume the Iterm2 is the best protocol to use for all terminals *unless* an env
-// variable is set that suggests the terminal is probably Kitty.
+// Kitty-like terminals are detected from env variables, then Sixel support is probed with DA1
+// (skipped for terminals that also support the iTerm2 protocol and inside tmux). Otherwise the
+// Iterm2 protocol is assumed.
 pub fn auto_detect() -> ImageProtocol {
     if detect_kitty_graphics_protocol() {
         if detect_tmux() {
             ImageProtocol::KittyUnicode { tmux: true }
         } else {
             ImageProtocol::Kitty
+        }
+    } else if !detect_tmux() && !prefers_iterm2() && detect_sixel() {
+        let (cell_width_px, cell_height_px) = detect_cell_pixel_size();
+        ImageProtocol::Sixel {
+            cell_width_px,
+            cell_height_px,
         }
     } else {
         ImageProtocol::Iterm2
@@ -45,6 +52,117 @@ pub enum ImageProtocol {
     Iterm2,
     Kitty,
     KittyUnicode { tmux: bool },
+    /// Sixel has no scaling, so the image is resized to the terminal's cell pixel size.
+    Sixel {
+        cell_width_px: u16,
+        cell_height_px: u16,
+    },
+}
+
+/// Returns the terminal cell size in pixels, falling back to a common size.
+pub fn detect_cell_pixel_size() -> (u16, u16) {
+    const FALLBACK: (u16, u16) = (10, 20);
+    // Ask the terminal itself first: over SSH the ioctl often reports no pixel size or a bogus one.
+    if let Some(size) = query_cell_size_csi().filter(|&s| is_plausible_cell_size(s)) {
+        return size;
+    }
+    if let Ok(w) = ratatui::crossterm::terminal::window_size() {
+        if w.columns > 0 && w.rows > 0 {
+            let size = (w.width / w.columns, w.height / w.rows);
+            if is_plausible_cell_size(size) {
+                return size;
+            }
+        }
+    }
+    FALLBACK
+}
+
+fn is_plausible_cell_size((w, h): (u16, u16)) -> bool {
+    (4..=200).contains(&w) && (8..=400).contains(&h)
+}
+
+/// Asks the terminal for its cell size with `CSI 16 t` (reply: `CSI 6 ; height ; width t`).
+fn query_cell_size_csi() -> Option<(u16, u16)> {
+    parse_cell_size_report(&query_terminal(b"\x1b[16t", b't')?)
+}
+
+/// Sends `request` and reads the reply up to and including the `end` byte (300ms timeout).
+#[cfg(unix)]
+fn query_terminal(request: &[u8], end: u8) -> Option<Vec<u8>> {
+    use std::{
+        io::IsTerminal,
+        os::fd::AsRawFd,
+        time::{Duration, Instant},
+    };
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return None;
+    }
+    ratatui::crossterm::terminal::enable_raw_mode().ok()?;
+    let result = (|| {
+        let mut out = io::stdout().lock();
+        out.write_all(request).ok()?;
+        out.flush().ok()?;
+        let fd = io::stdin().as_raw_fd();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let mut buf = Vec::new();
+        while Instant::now() < deadline && buf.last() != Some(&end) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pfd is a valid pollfd and we pass exactly one.
+            let n = unsafe { libc::poll(&mut pfd, 1, remaining.as_millis() as i32) };
+            if n <= 0 {
+                break;
+            }
+            let mut byte = 0u8;
+            // SAFETY: reads at most one byte into a valid buffer.
+            let r = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+            if r != 1 {
+                break;
+            }
+            buf.push(byte);
+        }
+        (buf.last() == Some(&end)).then_some(buf)
+    })();
+    let _ = ratatui::crossterm::terminal::disable_raw_mode();
+    result
+}
+
+#[cfg(not(unix))]
+fn query_terminal(_request: &[u8], _end: u8) -> Option<Vec<u8>> {
+    None
+}
+
+/// Detects Sixel support from the DA1 reply (`CSI ? Ps ; ... c`, where attribute 4 is Sixel).
+fn detect_sixel() -> bool {
+    query_terminal(b"\x1b[c", b'c').is_some_and(|reply| da1_reports_sixel(&reply))
+}
+
+fn da1_reports_sixel(reply: &[u8]) -> bool {
+    let Ok(s) = std::str::from_utf8(reply) else {
+        return false;
+    };
+    s.rsplit_once("\x1b[?")
+        .and_then(|(_, body)| body.strip_suffix('c'))
+        .is_some_and(|params| params.split(';').any(|p| p == "4"))
+}
+
+// Terminals that also speak the iTerm2 protocol keep using it, as before.
+fn prefers_iterm2() -> bool {
+    env::var("TERM_PROGRAM")
+        .is_ok_and(|p| matches!(p.as_str(), "iTerm.app" | "WezTerm" | "rio" | "vscode"))
+}
+
+fn parse_cell_size_report(buf: &[u8]) -> Option<(u16, u16)> {
+    let s = std::str::from_utf8(buf).ok()?;
+    let body = s.rsplit_once("\x1b[6;")?.1.strip_suffix('t')?;
+    let (h, w) = body.split_once(';')?;
+    let (w, h) = (w.parse::<u16>().ok()?, h.parse::<u16>().ok()?);
+    (w > 0 && h > 0).then_some((w, h))
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +210,15 @@ impl ImageProtocol {
             ImageProtocol::KittyUnicode { tmux } => {
                 return kitty_unicode_prepare(bytes, cell_width, image_id, *tmux);
             }
+            ImageProtocol::Sixel {
+                cell_width_px,
+                cell_height_px,
+            } => sixel_encode(
+                bytes,
+                cell_width,
+                *cell_width_px as u32,
+                *cell_height_px as u32,
+            ),
         };
         let mut cells = Vec::with_capacity(cell_width);
         cells.push(PreparedImageCell {
@@ -116,15 +243,21 @@ impl ImageProtocol {
 
     pub fn clear_line(&self, y: u16) {
         match self {
-            ImageProtocol::Iterm2 => {}
+            ImageProtocol::Iterm2 | ImageProtocol::Sixel { .. } => {}
             ImageProtocol::Kitty => kitty_clear_line(y),
             ImageProtocol::KittyUnicode { .. } => {}
         }
     }
 
+    /// Sixel pixels are not tracked by the terminal as separate objects, so they can only be
+    /// removed by erasing the cells (and forcing a full repaint).
+    pub fn requires_full_clear(&self) -> bool {
+        matches!(self, ImageProtocol::Sixel { .. })
+    }
+
     pub fn clear(&self) {
         match self {
-            ImageProtocol::Iterm2 => {}
+            ImageProtocol::Iterm2 | ImageProtocol::Sixel { .. } => {}
             ImageProtocol::Kitty => kitty_clear(),
             ImageProtocol::KittyUnicode { .. } => {}
         }
@@ -132,7 +265,7 @@ impl ImageProtocol {
 
     pub fn delete_images(&self, image_ids: &[u32]) -> Result<(), std::io::Error> {
         match self {
-            ImageProtocol::Iterm2 | ImageProtocol::Kitty => Ok(()),
+            ImageProtocol::Iterm2 | ImageProtocol::Kitty | ImageProtocol::Sixel { .. } => Ok(()),
             ImageProtocol::KittyUnicode { tmux } => kitty_unicode_delete_images(image_ids, *tmux),
         }
     }
@@ -599,5 +732,238 @@ fn passthrough_escapes(tmux: bool) -> (&'static str, &'static str, &'static str)
         ("\x1bPtmux;", "\x1b\x1b", "\x1b\\")
     } else {
         ("", "\x1b", "")
+    }
+}
+
+// https://vt100.net/docs/vt3xx-gp/chapter14.html
+fn sixel_encode(bytes: &[u8], cell_width: usize, cell_w_px: u32, cell_h_px: u32) -> String {
+    let Ok(img) = image::load_from_memory(bytes) else {
+        return String::new();
+    };
+    let width = cell_width as u32 * cell_w_px;
+    let height = cell_h_px;
+    let img = image::imageops::resize(
+        &img.to_rgba8(),
+        width,
+        height,
+        image::imageops::FilterType::Triangle,
+    );
+    sixel_from_rgba(&img, cell_width)
+}
+
+fn sixel_from_rgba(img: &image::RgbaImage, cell_width: usize) -> String {
+    let (width, height) = img.dimensions();
+    let (palette, indices) = sixel_quantize(img);
+
+    // Save the cursor, erase the covered cells (sixel pixels are not removed by diffing),
+    // restore, draw, and restore again so the cursor position does not depend on the terminal.
+    let mut s = format!("\x1b7{}\x1b8\x1b7", " ".repeat(cell_width));
+    s.push_str("\x1bP0;1;0q");
+    s.push_str(&format!("\"1;1;{width};{height}"));
+    for (i, [r, g, b]) in palette.iter().enumerate() {
+        let pct = |v: u8| (v as u32 * 100 + 127) / 255;
+        s.push_str(&format!("#{i};2;{};{};{}", pct(*r), pct(*g), pct(*b)));
+    }
+
+    let w = width as usize;
+    for band_top in (0..height as usize).step_by(6) {
+        let band_h = (height as usize - band_top).min(6);
+        // sixel bits per color per column
+        let mut used: Vec<u8> = Vec::new();
+        let mut columns: Vec<Vec<u8>> = vec![Vec::new(); palette.len()];
+        for x in 0..w {
+            for dy in 0..band_h {
+                let idx = indices[(band_top + dy) * w + x];
+                if idx == u8::MAX as u16 + 1 {
+                    continue; // transparent
+                }
+                let c = idx as usize;
+                if columns[c].is_empty() {
+                    columns[c] = vec![0; w];
+                    used.push(c as u8);
+                }
+                columns[c][x] |= 1 << dy;
+            }
+        }
+        for (n, &c) in used.iter().enumerate() {
+            if n > 0 {
+                s.push('$');
+            }
+            s.push_str(&format!("#{c}"));
+            sixel_push_rle(&mut s, &columns[c as usize]);
+        }
+        s.push('-');
+    }
+    s.push_str("\x1b\\\x1b8");
+    s
+}
+
+fn sixel_push_rle(s: &mut String, data: &[u8]) {
+    let mut i = 0;
+    while i < data.len() {
+        let v = data[i];
+        let mut run = 1;
+        while i + run < data.len() && data[i + run] == v {
+            run += 1;
+        }
+        let ch = (v + 63) as char;
+        if run > 3 {
+            s.push_str(&format!("!{run}{ch}"));
+        } else {
+            for _ in 0..run {
+                s.push(ch);
+            }
+        }
+        i += run;
+    }
+}
+
+const SIXEL_TRANSPARENT: u16 = 256;
+
+/// Reduces the image to at most 256 colors. Returns the palette and per-pixel palette indices
+/// (`SIXEL_TRANSPARENT` for transparent pixels).
+fn sixel_quantize(img: &image::RgbaImage) -> (Vec<[u8; 3]>, Vec<u16>) {
+    use std::collections::HashMap;
+
+    let mut counts: HashMap<[u8; 3], u32> = HashMap::new();
+    for p in img.pixels() {
+        if p[3] >= 128 {
+            *counts.entry([p[0], p[1], p[2]]).or_default() += 1;
+        }
+    }
+
+    let palette: Vec<[u8; 3]> = if counts.len() <= 256 {
+        let mut v: Vec<_> = counts.keys().copied().collect();
+        v.sort_unstable();
+        v
+    } else {
+        median_cut(counts.into_iter().collect(), 256)
+    };
+
+    let mut cache: HashMap<[u8; 3], u16> = HashMap::new();
+    let indices = img
+        .pixels()
+        .map(|p| {
+            if p[3] < 128 {
+                return SIXEL_TRANSPARENT;
+            }
+            let key = [p[0], p[1], p[2]];
+            *cache.entry(key).or_insert_with(|| {
+                palette
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, c)| {
+                        (0..3)
+                            .map(|i| (c[i] as i32 - key[i] as i32).pow(2))
+                            .sum::<i32>()
+                    })
+                    .map(|(i, _)| i as u16)
+                    .unwrap_or(0)
+            })
+        })
+        .collect();
+    (palette, indices)
+}
+
+fn median_cut(colors: Vec<([u8; 3], u32)>, max: usize) -> Vec<[u8; 3]> {
+    let mut boxes = vec![colors];
+    while boxes.len() < max {
+        // split the box with the widest channel range
+        let Some((bi, ch, range)) = boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.len() > 1)
+            .map(|(i, b)| {
+                (0..3)
+                    .map(|c| {
+                        let lo = b.iter().map(|(p, _)| p[c]).min().unwrap();
+                        let hi = b.iter().map(|(p, _)| p[c]).max().unwrap();
+                        (i, c, hi - lo)
+                    })
+                    .max_by_key(|t| t.2)
+                    .unwrap()
+            })
+            .max_by_key(|t| t.2)
+        else {
+            break;
+        };
+        if range == 0 {
+            break;
+        }
+        let mut b = boxes.swap_remove(bi);
+        b.sort_unstable_by_key(|(p, _)| p[ch]);
+        let total: u64 = b.iter().map(|(_, n)| *n as u64).sum();
+        let mut acc = 0u64;
+        let mut split = 1;
+        for (i, (_, n)) in b.iter().enumerate() {
+            acc += *n as u64;
+            if acc * 2 >= total {
+                split = (i + 1).min(b.len() - 1);
+                break;
+            }
+        }
+        let hi = b.split_off(split);
+        boxes.push(b);
+        boxes.push(hi);
+    }
+    boxes
+        .iter()
+        .map(|b| {
+            let total: u64 = b.iter().map(|(_, n)| *n as u64).sum::<u64>().max(1);
+            let avg = |c: usize| {
+                (b.iter().map(|(p, n)| p[c] as u64 * *n as u64).sum::<u64>() / total) as u8
+            };
+            [avg(0), avg(1), avg(2)]
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod sixel_tests {
+    use super::*;
+
+    #[test]
+    fn encodes_two_color_image() {
+        let mut img = image::RgbaImage::new(4, 8);
+        for (x, _, p) in img.enumerate_pixels_mut() {
+            *p = if x < 2 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 0, 0])
+            };
+        }
+        let s = sixel_from_rgba(&img, 1);
+        assert!(s.contains("\x1bP0;1;0q\"1;1;4;8#0;2;100;0;0"));
+        // two bands (6 + 2 rows); red columns 0..2, transparent columns skipped
+        assert!(s.contains("#0~~??-#0BB??-"));
+        assert!(s.ends_with("\x1b\\\x1b8"));
+    }
+
+    #[test]
+    fn quantizes_many_colors_to_256() {
+        let mut img = image::RgbaImage::new(64, 64);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgba([(x * 4) as u8, (y * 4) as u8, ((x + y) * 2) as u8, 255]);
+        }
+        let (palette, indices) = sixel_quantize(&img);
+        assert!(palette.len() <= 256);
+        assert!(indices.iter().all(|&i| (i as usize) < palette.len()));
+    }
+}
+
+#[cfg(test)]
+mod cell_size_tests {
+    use super::{da1_reports_sixel, is_plausible_cell_size, parse_cell_size_report};
+
+    #[test]
+    fn parses_cell_size() {
+        assert_eq!(parse_cell_size_report(b"\x1b[6;38;19t"), Some((19, 38)));
+        assert_eq!(parse_cell_size_report(b""), None);
+        assert!(is_plausible_cell_size((10, 20)));
+        assert!(!is_plausible_cell_size((1, 1)));
+        assert!(da1_reports_sixel(b"\x1b[?61;4;6;22c"));
+        assert!(da1_reports_sixel(b"\x1b[?62;4c"));
+        assert!(!da1_reports_sixel(b"\x1b[?62;14c"));
+        assert!(!da1_reports_sixel(b"\x1b[?1;2c"));
     }
 }

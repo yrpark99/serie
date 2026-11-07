@@ -1331,6 +1331,10 @@ mod tests {
             ImageProtocol::Kitty,
             ImageProtocol::KittyUnicode { tmux: false },
             ImageProtocol::KittyUnicode { tmux: true },
+            ImageProtocol::Sixel {
+                cell_width_px: 10,
+                cell_height_px: 20,
+            },
         ] {
             with_commit_list_state_and_protocol(&["first", "second"], image_protocol, |state| {
                 state.ensure_visible_graph_uploaded();

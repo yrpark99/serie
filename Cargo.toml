@@ -35,6 +35,9 @@ toml = "1.1.8"
 tui-input = "0.15.5"
 umbra = "0.6.0"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
 [dev-dependencies]
 font8x8 = "0.3.1"
 rstest = "0.28.0"

@@ -124,6 +124,7 @@ The protocol type for rendering images of commit graphs.
   - `iterm`
   - `kitty`
   - `kitty-unicode`
+  - `sixel`
 
 The value specified in the command line argument takes precedence.
 

@@ -345,6 +345,9 @@ impl App<'_> {
     fn draw(&mut self, terminal: &mut DefaultTerminal) -> Result<(), std::io::Error> {
         match self.app_status.pending_clear {
             PendingClear::None => {}
+            PendingClear::ViewImages if self.ctx.image_protocol.requires_full_clear() => {
+                clear_fullscreen(terminal)?
+            }
             PendingClear::ViewImages => self.clear_view_image_area(terminal)?,
             PendingClear::Screen => {
                 self.ctx.image_protocol.clear();

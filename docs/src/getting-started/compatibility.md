@@ -5,6 +5,8 @@
 These image protocols are supported:
 
 - [Inline Images Protocol (iTerm2)](https://iterm2.com/documentation-images.html)
+- [Sixel graphics](https://vt100.net/docs/vt3xx-gp/chapter14.html)
+  - Auto-detected via the terminal's device attributes (DA1) unless the terminal also supports the iTerm2 protocol or tmux is used; otherwise specify `sixel` as the `protocol` option explicitly. The image is rendered at the terminal's cell pixel size.
 - [Terminal graphics protocol (kitty)](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
   - Supports both the existing graphics protocol mode and [the Unicode placeholder](https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders) mode.
 
@@ -37,6 +39,6 @@ Rendering using Unicode Placeholder is available by explicitly specifying `kitty
 
 ### Unsupported environments
 
-- Sixel graphics is not supported.
+- Sixel graphics inside tmux/screen/Zellij is not supported.
 - Other terminal multiplexers (screen, Zellij, etc.) other than those listed in [Partially supported environments](#partially-supported-environments) are not supported.
 - Windows is not officially supported. Please refer to [the related issue](https://github.com/lusingander/serie/issues/147#issuecomment-4192875627).

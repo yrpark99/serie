@@ -1930,6 +1930,7 @@ dependencies = [
  "garde",
  "image",
  "laurier",
+ "libc",
  "once_cell",
  "ratatui",
  "rstest",

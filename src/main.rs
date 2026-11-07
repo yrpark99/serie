@@ -89,6 +89,7 @@ enum ImageProtocolType {
     Iterm,
     Kitty,
     KittyUnicode,
+    Sixel,
 }
 
 impl From<Option<ImageProtocolType>> for protocol::ImageProtocol {
@@ -100,6 +101,13 @@ impl From<Option<ImageProtocolType>> for protocol::ImageProtocol {
             Some(ImageProtocolType::KittyUnicode) => protocol::ImageProtocol::KittyUnicode {
                 tmux: protocol::detect_tmux(),
             },
+            Some(ImageProtocolType::Sixel) => {
+                let (cell_width_px, cell_height_px) = protocol::detect_cell_pixel_size();
+                protocol::ImageProtocol::Sixel {
+                    cell_width_px,
+                    cell_height_px,
+                }
+            }
             None => protocol::auto_detect(),
         }
     }
